@@ -5,8 +5,8 @@
 ;; Author: Steve Purcell <steve@sanityinc.com>
 ;; Keywords: processes, tools
 ;; Homepage: https://github.com/purcell/envrc
-;; Package-Requires: ((seq "2") (emacs "25.1") (inheritenv "0.1"))
-;; Package-Version: 0
+;; Package-Requires: ((emacs "26.1") (inheritenv "0.1"))
+;; Package-Version: 0.12
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -61,7 +61,9 @@
 (require 'subr-x)
 (require 'ansi-color)
 (require 'cl-lib)
+(require 'diff-mode) ; for its faces
 (require 'inheritenv)
+(require 'comint)
 
 ;;; Custom vars and minor modes
 
@@ -74,25 +76,41 @@
 Messages are written into the *envrc-debug* buffer."
   :type 'boolean)
 
-;; FIXME in some context this seems to void... Currently unused
+(defcustom envrc-update-on-eshell-directory-change t
+  "Whether envrc will update environment when changing directory in eshell."
+  :type 'boolean)
+
+(defcustom envrc-show-summary-in-minibuffer t
+  "When non-nil, show a summary of the changes made by direnv in the minibuffer."
+  :group 'envrc
+  :type 'boolean)
+
 (defcustom envrc-direnv-executable "direnv"
   "The direnv executable used by envrc."
   :type 'string)
 
 (define-obsolete-variable-alias 'envrc--lighter 'envrc-lighter "2021-05-17")
 
-(defcustom envrc-lighter '(:eval (envrc--lighter))
+(defcustom envrc-lighter '(:propertize (:eval (envrc--lighter))
+                                       mouse-face mode-line-highlight
+                                       local-map (keymap
+                                                  (mode-line keymap
+                                                             (down-mouse-1 . envrc-show-log))))
   "The mode line lighter for `envrc-mode'.
 You can set this to nil to disable the lighter."
   :type 'sexp)
 (put 'envrc-lighter 'risky-local-variable t)
 
-(defcustom envrc-none-lighter '(" envrc[" (:propertize "none" face envrc-mode-line-none-face) "]")
+(defcustom envrc-none-lighter nil
   "Lighter spec used by the default `envrc-lighter' when envrc is inactive."
   :type 'sexp)
 
 (defcustom envrc-on-lighter '(" envrc[" (:propertize "on" face envrc-mode-line-on-face) "]")
   "Lighter spec used by the default `envrc-lighter' when envrc is on."
+  :type 'sexp)
+
+(defcustom envrc-updating-lighter '(" envrc[" (:propertize "updating" face envrc-mode-line-updating-face) "]")
+  "Lighter spec used by the default `envrc-lighter' when envrc is updating."
   :type 'sexp)
 
 (defcustom envrc-error-lighter '(" envrc[" (:propertize "error" face envrc-mode-line-error-face) "]")
@@ -104,17 +122,18 @@ You can set this to nil to disable the lighter."
     (define-key map (kbd "a") 'envrc-allow)
     (define-key map (kbd "d") 'envrc-deny)
     (define-key map (kbd "r") 'envrc-reload)
+    (define-key map (kbd "l") 'envrc-show-log)
     map)
   "Keymap for commands in `envrc-mode'.
 See `envrc-mode-map' for how to assign a prefix binding to these."
-  :type 'keymap)
+  :type '(restricted-sexp :match-alternatives (keymapp)))
 (fset 'envrc-command-map envrc-command-map)
 
 (defcustom envrc-mode-map (make-sparse-keymap)
   "Keymap for `envrc-mode'.
 To access `envrc-command-map' from this map, give it a prefix keybinding,
-e.g. (define-key envrc-mode-map (kbd \"C-c e\") 'envrc-command-map)"
-  :type 'keymap)
+e.g. (define-key envrc-mode-map (kbd \"C-c e\") \\='envrc-command-map)"
+  :type '(restricted-sexp :match-alternatives (keymapp)))
 
 ;;;###autoload
 (define-minor-mode envrc-mode
@@ -123,12 +142,17 @@ e.g. (define-key envrc-mode-map (kbd \"C-c e\") 'envrc-command-map)"
   :lighter envrc-lighter
   :keymap envrc-mode-map
   (if envrc-mode
-      (envrc--update)
-    (envrc--clear (current-buffer))))
+      (progn
+        (envrc--update)
+        (when (and (derived-mode-p 'eshell-mode) envrc-update-on-eshell-directory-change)
+          (add-hook 'eshell-directory-change-hook #'envrc--update nil t)))
+    (envrc--clear (current-buffer))
+    (remove-hook 'eshell-directory-change-hook #'envrc--update t)))
 
 ;;;###autoload
 (define-globalized-minor-mode envrc-global-mode envrc-mode
-  (lambda () (unless (or (minibufferp) (file-remote-p default-directory))
+  (lambda () (when (and (not (minibufferp)) (not (file-remote-p default-directory))
+                        (executable-find envrc-direnv-executable))
                (envrc-mode 1))))
 
 (defface envrc-mode-line-on-face '((t :inherit success))
@@ -137,20 +161,29 @@ e.g. (define-key envrc-mode-map (kbd \"C-c e\") 'envrc-command-map)"
 (defface envrc-mode-line-error-face '((t :inherit error))
   "Face used in mode line to indicate that direnv failed.")
 
+(defface envrc-mode-line-updating-face '((t :inherit warning))
+  "Face used in mode line to indicate that direnv is not active.")
+
 (defface envrc-mode-line-none-face '((t :inherit warning))
   "Face used in mode line to indicate that direnv is not active.")
 
 ;;; Global state
 
 (defvar envrc--cache (make-hash-table :test 'equal :size 10)
-  "Known envrc directorie and their direnv results.
+  "Known envrc directories and their direnv results.
 The values are as produced by `envrc--export'.")
+
+(defvar envrc--running-processes (make-hash-table :test 'equal :size 10)
+  "Processes running by envrc.")
+
+(defvar envrc--running-processes-callbacks (make-hash-table :test 'equal :size 10)
+  "Callbacks for each process running by envrc.")
 
 ;;; Local state
 
 (defvar-local envrc--status 'none
   "Symbol indicating state of the current buffer's direnv.
-One of '(none on error).")
+One of \\='(none on error).")
 
 ;;; Internals
 
@@ -158,6 +191,7 @@ One of '(none on error).")
   "Return a colourised version of `envrc--status' for use in the mode line."
   (pcase envrc--status
     (`on envrc-on-lighter)
+    (`updating envrc-updating-lighter)
     (`error envrc-error-lighter)
     (`none envrc-none-lighter)))
 
@@ -191,7 +225,9 @@ since its output can vary according to its initial environment."
   "Update the current buffer's environment if it is managed by direnv.
 All envrc.el-managed buffers with this env will have their
 environments updated."
-  (let ((env-dir (envrc--find-env-dir)))
+  (let ((env-dir (envrc--find-env-dir))
+        (buf (current-buffer)))
+    (setq-local envrc--status 'updating)
     (if env-dir
         (let ((cache-key (envrc--cache-key env-dir (default-value 'process-environment))))
           (pcase (gethash cache-key envrc--cache 'missing)
@@ -199,18 +235,33 @@ environments updated."
              (envrc--export env-dir
                             (lambda (result)
                               (puthash cache-key result envrc--cache)
-                              (envrc--apply (current-buffer) result))))
-            (cached (envrc--apply (current-buffer) cached))))
-      (envrc--apply (current-buffer) 'none))))
+                              (envrc--apply buf result))))
+            (cached (envrc--apply buf cached))))
+      (envrc--apply buf 'none))))
 
+(defvar envrc-log-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "g" #'envrc-reload)
+    map))
+
+;;;###autoload
+(define-derived-mode envrc-log-mode special-mode "Envrc Log"
+  "Major mode for Envrc log buffer.")
+
+(defun envrc--log-buffer-name ()
+  "Buffer name to use for envrc log buffers."
+  (concat "*"
+          (file-name-nondirectory
+           (directory-file-name default-directory))
+          "-envrc*"))
 
 (defmacro envrc--at-end-of-special-buffer (name &rest body)
   "At the end of `special-mode' buffer NAME, execute BODY.
 To avoid confusion, `envrc-mode' is explicitly disabled in the buffer."
   (declare (indent 1))
   `(with-current-buffer (get-buffer-create ,name)
-     (unless (derived-mode-p 'special-mode)
-       (special-mode))
+     (unless (derived-mode-p 'envrc-log-mode)
+       (envrc-log-mode))
      (when envrc-mode (envrc-mode -1))
      (goto-char (point-max))
      (let ((inhibit-read-only t))
@@ -224,38 +275,90 @@ MSG and ARGS are as for that function."
       (insert (apply 'format msg args))
       (newline))))
 
+(defun envrc--summarise-changes (items)
+  "Create a summary string for ITEMS."
+  (if items
+      (cl-loop for (name . val) in items
+               if (not (string-prefix-p "DIRENV_" name))
+               collect (cons name
+                             (if val
+                                 (if (let ((process-environment (default-value 'process-environment)))
+                                       (getenv name))
+                                     '("~" diff-changed)
+                                   '("+" diff-added))
+                               '("-" diff-removed)))
+               into entries
+               finally return (cl-loop for (name prefix face) in (seq-sort-by 'car 'string< entries)
+                                       collect (propertize (concat prefix name) 'face face) into strings
+                                       finally return (string-join strings " ")))
+    "no changes"))
+
+(defun envrc--show-summary (result directory)
+  "Summarise successful RESULT in the minibuffer.
+DIRECTORY is the directory in which the environment changes."
+  (message "direnv: %s %s"
+           (envrc--summarise-changes result)
+           (propertize (concat "(" (abbreviate-file-name (directory-file-name directory)) ")")
+                       'face 'font-lock-comment-face)))
+
+(defun envrc--export-new-process (env-dir callback)
+  "Export the env vars for ENV-DIR using direnv."
+  (let ((cache-key (envrc--cache-key env-dir (default-value 'process-environment)))
+        result
+        process)
+    (message "Running direnv in %s..." env-dir)
+    (puthash cache-key (cons callback (gethash cache-key envrc--running-processes-callbacks)) envrc--running-processes-callbacks)
+    (puthash cache-key (envrc--make-process-with-global-env
+                        `("direnv" "export" "json")
+                        (lambda (exit-code stdout stderr)
+                          (envrc--debug "Direnv exited with %s and stderr=%S, stdout=%S" exit-code stderr stdout)
+                          (if (zerop exit-code)
+                              (progn
+                                (message "Direnv succeeded in %s" env-dir)
+                                (if (length= stdout 0)
+                                    (setq result 'none)
+                                  (prog1
+                                      (setq result (let ((json-key-type 'string)) (json-read-from-string stdout)))
+                                    (when envrc-show-summary-in-minibuffer
+                                      (envrc--show-summary result env-dir)))))
+                            (message "Direnv failed in %s" env-dir)
+                            (setq result 'error))
+                          (envrc--at-end-of-special-buffer (envrc--log-buffer-name)
+                            (insert "==== " (format-time-string "%Y-%m-%d %H:%M:%S") " ==== " env-dir " ====\n\n")
+                            (let ((initial-pos (point)))
+                              (insert (let (ansi-color-context) (ansi-color-apply stderr)))
+                              (goto-char (point-max))
+                              (add-face-text-property initial-pos (point) (if (zerop exit-code) 'success 'error)))
+                            (insert "\n\n")
+                            (unless (eq 0 exit-code) ;; zerop is not an option, as exit-code may sometimes be a symbol
+                              (message "%s" stderr)))
+
+                          ;; check again for callbacks in case they got added while this was running
+                          (pcase (gethash cache-key envrc--running-processes-callbacks 'missing)
+                            (`missing nil)
+                            (callbacks
+                             (remhash cache-key envrc--running-processes-callbacks)
+                             (dolist (x callbacks) (funcall x result))))
+                          (remhash cache-key envrc--running-processes)))
+             envrc--running-processes)))
+
 (defun envrc--export (env-dir callback)
-  "Export the env vars for ENV-DIR using direnv.
-Return value is either 'error, 'none, or an alist of environment
-variable names and values."
+  "Export the env vars for ENV-DIR using direnv."
   (unless (envrc--env-dir-p env-dir)
     (error "%s is not a directory with a .envrc" env-dir))
-  (message "Running direnv in %s..." env-dir)
-  (envrc--make-process-with-global-env
-   `("direnv" "export" "json")
-    (lambda (exit-code stdout stderr)
-      (envrc--debug "Direnv exited with %s and stderr=%S, stdout=%S" exit-code stderr stdout)
-      (if (zerop exit-code)
-          (progn
-            (message "Direnv succeeded in %s" env-dir)
-            (if (zerop (buffer-size))
-                (setq result 'none)
-              (goto-char (point-min))
-              (setq result (let ((json-key-type 'string)) (json-read-from-string stdout)))))
-        (message "Direnv failed in %s" env-dir)
-        (setq result 'error))
-      (envrc--at-end-of-special-buffer "*envrc*"
-        (insert "==== " (format-time-string "%Y-%m-%d %H:%M:%S") " ==== " env-dir " ====\n\n")
-        (let ((initial-pos (point)))
-          (insert (let (ansi-color-context) (ansi-color-apply stderr)))
-          (goto-char (point-max))
-          (add-face-text-property initial-pos (point) (if (zerop exit-code) 'success 'error)))
-        (insert "\n\n")
-        (unless (zerop exit-code)
-          (message "%s" stderr)))
-      (funcall callback result))))
-
-
+  (let ((cache-key (envrc--cache-key env-dir (default-value 'process-environment)))
+        result)
+    (pcase (gethash cache-key envrc--running-processes-callbacks 'missing)
+      (`missing
+       (envrc--export-new-process env-dir callback))
+      (callbacks
+       ;; Make sure process is still running.
+       (let ((process (gethash cache-key envrc--running-processes)))
+         (if (and process (memq (process-status process) '(open run stop)))
+             (puthash cache-key (push callback callbacks) envrc--running-processes-callbacks)
+           (progn
+             (remhash cache-key envrc--running-processes)
+             (envrc--export-new-process env-dir callback))))))))
 
 ;; Forward declaration for the byte compiler
 (defvar eshell-path-env)
@@ -279,6 +382,7 @@ also appear in PAIRS."
   (with-current-buffer buf
     (kill-local-variable 'exec-path)
     (kill-local-variable 'process-environment)
+    (kill-local-variable 'info-directory-list)
     (when (derived-mode-p 'eshell-mode)
       (if (fboundp 'eshell-set-path)
           (eshell-set-path (butlast exec-path))
@@ -300,7 +404,9 @@ also appear in PAIRS."
         (when (derived-mode-p 'eshell-mode)
           (if (fboundp 'eshell-set-path)
               (eshell-set-path path)
-            (setq-local eshell-path-env path)))))))
+            (setq-local eshell-path-env path))))
+      ;; Force info.el to parse INFOPATH again in case direnv modified it
+      (when (getenv "INFOPATH") (setq-local Info-directory-list nil)))))
 
 (defun envrc--update-env (env-dir)
   "Refresh the state of the direnv in ENV-DIR and apply in all relevant buffers."
@@ -331,6 +437,32 @@ If there is no current env dir, abort with a user error."
        (user-error "No enclosing .envrc"))
      ,@body))
 
+(defun envrc--filter (proc string)
+  "Process filter for envrc."
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            ;; `save-excursion' doesn't use the right insertion-type for us.
+            (pos (copy-marker (point) t))
+            ;; `save-restriction' doesn't use the right insertion type either:
+            ;; If we are inserting at the end of the accessible part of the
+            ;; buffer, keep the inserted text visible.
+	    (min (point-min-marker))
+	    (max (copy-marker (point-max) t))
+	    (envrc-filter-start (marker-position (process-mark proc))))
+        (unwind-protect
+            (progn
+	      (widen)
+	      (goto-char envrc-filter-start)
+              (insert string)
+              (comint-carriage-motion (process-mark proc) (point))
+              (set-marker (process-mark proc) (point)))
+	  (goto-char pos)
+          (narrow-to-region min max)
+	  (set-marker pos nil)
+	  (set-marker min nil)
+	  (set-marker max nil))))))
+
 (defun envrc--make-process-with-global-env (command callback)
   "Starts a process with `make-process', but always use the global process environment.
 In particular, we ensure the default variable `exec-path' and
@@ -340,20 +472,25 @@ When the process is finished it will run the provided `callback' function with
 the exit code, stdout and stderr of the process."
   (let* ((exec-path (default-value 'exec-path))
          (process-environment (default-value 'process-environment))
-         (stderr-buffer (generate-new-buffer "*direnv stderr*")))
+         (stderr-buffer (generate-new-buffer "*direnv stderr*"))
+         (stdout-buffer (generate-new-buffer "*direnv*")))
+    (with-current-buffer stderr-buffer (setq buffer-read-only t))
+    (with-current-buffer stdout-buffer (setq buffer-read-only t))
     (make-process
      :name "direnv"
      :command command
-     :buffer (generate-new-buffer "*direnv*")
+     :buffer stdout-buffer
      :stderr stderr-buffer
      :connection-type 'pipe
+     :noquery t
+     :filter #'envrc--filter
      :sentinel (lambda (process event)
                  (unless (string= event "run\n")
                    (let* ((stdout (with-current-buffer (process-buffer process) (buffer-string)))
                           (stderr (with-current-buffer stderr-buffer (buffer-string))))
-                    (funcall callback (process-exit-status process) stdout stderr)
-                    (kill-buffer (process-buffer process))
-                    (kill-buffer stderr-buffer)))))))
+                     (funcall callback (process-exit-status process) stdout stderr)
+                     (kill-buffer (process-buffer process))
+                     (kill-buffer stderr-buffer)))))))
 
 (defun envrc-reload ()
   "Reload the current env."
@@ -365,17 +502,17 @@ the exit code, stdout and stderr of the process."
   "Run \"direnv allow\" in the current env."
   (interactive)
   (envrc--with-required-current-env env-dir
-     (let* ((default-directory env-dir))
-        (envrc--make-process-with-global-env
-         `("direnv" "allow")
-          (lambda (exit-code stdout stderr)
-           (if (zerop exit-code)
-               (with-current-buffer (get-buffer-create "*envrc-allow*")
-                 (erase-buffer)
-                 (insert stdout)
-                 (insert stderr)
-                 (display-buffer (current-buffer)))
-               (user-error "Error running direnv allow")))))))
+    (let* ((default-directory env-dir))
+      (envrc--make-process-with-global-env
+       `("direnv" "allow")
+       (lambda (exit-code stdout stderr)
+         (if (zerop exit-code)
+             (with-current-buffer (get-buffer-create "*envrc-allow*")
+               (erase-buffer)
+               (insert stdout)
+               (insert stderr)
+               (display-buffer (current-buffer)))
+           (user-error "Error running direnv allow")))))))
 
 (defun envrc-deny ()
   "Run \"direnv deny\" in the current env."
@@ -384,14 +521,14 @@ the exit code, stdout and stderr of the process."
     (let* ((default-directory env-dir))
       (envrc--make-process-with-global-env
        `("direnv" "deny")
-        (lambda (exit-code stdout stderr)
+       (lambda (exit-code stdout stderr)
          (if (zerop exit-code)
              (with-current-buffer (get-buffer-create "*envrc-deny*")
                (erase-buffer)
                (insert stdout)
                (insert stderr)
                (display-buffer (current-buffer)))
-             (user-error "Error running direnv deny")))))))
+           (user-error "Error running direnv deny")))))))
 
 (defun envrc-reload-all ()
   "Reload direnvs for all buffers.
@@ -403,6 +540,12 @@ This can be useful if a .envrc has been deleted."
     (with-current-buffer buf
       (envrc--update))))
 
+(defun envrc-show-log ()
+  "Open envrc log buffer."
+  (interactive)
+  (if-let ((buffer (get-buffer "*envrc*")))
+      (pop-to-buffer buffer)
+    (message "Envrc log buffer does not exist")))
 
 
 ;;; Propagate local environment to commands that use temp buffers
@@ -432,11 +575,14 @@ in a temp buffer.  ARGS is as for ORIG."
     "use" "use_guix" "use_flake" "use_nix" "user_rel_path" "watch_dir" "watch_file")
   "Useful direnv keywords to be highlighted.")
 
+(declare-function sh-set-shell "sh-script")
+
 ;;;###autoload
 (define-derived-mode envrc-file-mode
   sh-mode "envrc"
   "Major mode for .envrc files as used by direnv.
 \\{envrc-file-mode-map}"
+  (sh-set-shell "bash")
   (font-lock-add-keywords
    nil `((,(regexp-opt envrc-file-extra-keywords 'symbols)
           (0 font-lock-keyword-face)))))
@@ -451,5 +597,6 @@ in a temp buffer.  ARGS is as for ORIG."
 ;; LocalWords:  envrc direnv
 
 ;; Local Variables:
+;; coding: utf-8
 ;; indent-tabs-mode: nil
 ;; End:

@@ -1,6 +1,6 @@
 [![Melpa Status](http://melpa.org/packages/envrc-badge.svg)](https://melpa.org/#/envrc)
 [![Melpa Stable Status](http://stable.melpa.org/packages/envrc-badge.svg)](http://stable.melpa.org/#/envrc)
-[![Build Status](https://github.com/purcell/envrc/workflows/CI/badge.svg)](https://github.com/purcell/envrc/actions)
+[![Build Status](https://github.com/purcell/envrc/actions/workflows/test.yml/badge.svg)](https://github.com/purcell/envrc/actions/workflows/test.yml)
 <a href="https://www.patreon.com/sanityinc"><img alt="Support me" src="https://img.shields.io/badge/Support%20Me-%F0%9F%92%97-ff69b4.svg"></a>
 
 # envrc.el - buffer-local direnv integration for Emacs
@@ -14,10 +14,17 @@ the environment variables specified in those files. This allows
 different versions of linters and other tools to be used in each
 project if desired.
 
-This library is like [the `direnv.el`
-package](https://github.com/wbolster/emacs-direnv), but sets all
-environment variables buffer-locally, while `direnv.el` changes
-the global set of environment variables after each command.
+## How does this differ from `direnv.el`?
+
+[`direnv.el`](https://github.com/wbolster/emacs-direnv) repeatedly
+changes the global Emacs environment, based on tracking what buffer
+you're working on.
+
+Instead, `envrc.el` simply sets and stores the right environment in
+each buffer, as a buffer-local variable.
+
+From a user perspective, both are well tested and typically work fine,
+but the `envrc.el` approach feels cleaner to me.
 
 ## Installation
 
@@ -30,22 +37,31 @@ the latest release or clone the repository, and install
 
 ## Usage
 
-Add the following to your `init.el` (after calling `package-initialize`):
+Add a snippet like the following at the **bottom of your `init.el`**:
 
 ```el
 (envrc-global-mode)
 ```
+or
+```el
+(add-hook 'after-init-hook 'envrc-global-mode)
+```
+or, if you're a `use-package` fan:
+```el
+(use-package envrc
+  :hook (after-init . envrc-global-mode))
+```
 
-It's probably wise to do this *late in your startup sequence*: you
-normally want `envrc-mode` to be initialized in each buffer *before*
+Why must you enable the global mode *late in your startup sequence* like this? 
+You normally want `envrc-mode` to be initialized in each buffer *before*
 other minor modes like `flycheck-mode` which might look for
 executables. Counter-intuitively, this means that `envrc-global-mode`
 should be enabled *after* other global minor modes, since each
 _prepends_ itself to various hooks.
 
-You should only enable the mode if `direnv` is installed and available
-in the default Emacs `exec-path`. (There is a local minor mode
-`envrc-mode`, but you should not try to enable this granularly,
+The global mode will only have an effect if `direnv` is installed and
+available in the default Emacs `exec-path`. (There is a local minor
+mode `envrc-mode`, but you should not try to enable this granularly,
 e.g. for certain modes or projects, because compilation and other
 buffers might not get set up with the right environment.)
 
